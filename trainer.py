@@ -281,3 +281,24 @@ def generic_train(
     trainer.fit(model)
 
     return trainer
+
+if __name__ == "__main__":
+    import os
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser = VIT_Model.add_model_specific_args(parser, os.getcwd())
+    parser = add_train_parser(parser)
+    parser.add_argument("--gpus", default=0, type=int)
+    parser.add_argument("--load_model", default=None, type=str)
+    parser.add_argument("--resume_from_checkpoint", default=None, type=str)
+    args = parser.parse_args()
+    print(args)
+    model = VIT_Model(args)
+    if args.load_model is not None:
+        print("===load model binary to {}===".format(args.load_model))
+        model.load_from_checkpoint(args.load_model, hparams=args)
+        print(model.hparams)
+    else:
+        model = VIT_Model(args)
+    trainer = generic_train(model, args)
