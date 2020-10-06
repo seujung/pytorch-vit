@@ -10,7 +10,6 @@
     "model_type": "bert",
     "num_attention_heads": 12,
     "num_hidden_layers": 12,
-    "channel":3,
     "image_size": 256,
     "patch_size": 16,
     "num_classes": 258

@@ -16,7 +16,8 @@ from transformers.modeling_outputs import (
 )
 BertLayerNorm = torch.nn.LayerNorm
 
-def patch_image(x:torch.Tensor, size:int, ch:int,  N:int):
+def patch_image(x:torch.Tensor, size:int, N:int):
+    assert size % N == 0
     slice_size = int(size / N)
     out = []
     batch_size = x.shape[0]
@@ -411,7 +412,7 @@ class VIT(BertPreTrainedModel):
         **kwargs):
 
         if input_ids is not None:
-            input_ids = patch_image(input_ids, size=self.config.image_size, ch=self.config.channel, N=self.config.patch_size)
+            input_ids = patch_image(input_ids, size=self.config.image_size, N=self.config.patch_size)
             cls_tokens = self.cls_token.expand(input_ids.shape[0], -1, -1)
             input_ids = torch.cat((cls_tokens, input_ids), dim=1)
             input_shape = input_ids.size()[0], input_ids.size()[1]
