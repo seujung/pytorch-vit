@@ -432,7 +432,6 @@ class VIT(BertPreTrainedModel):
 
         embedding_output = self.embeddings(
             input_ids=input_ids, position_ids=position_ids)
-        print(embedding_output.shape)
         
         encoder_outputs = self.encoder(
             embedding_output,

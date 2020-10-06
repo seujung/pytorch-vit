@@ -13,6 +13,6 @@
     "channel":3,
     "image_size": 256,
     "patch_size": 16,
-    "num_classes": 200
+    "num_classes": 258
   }
   

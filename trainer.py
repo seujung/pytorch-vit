@@ -3,20 +3,21 @@ import logging
 import os
 import sys
 import torch
+from collections import OrderedDict
 from glob import glob
 from pathlib import Path
 from typing import Any, Dict
 from torch import nn
+import torch.nn.functional as F
 import torchvision
 from torchvision import transforms
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateLogger
-from pytorch_lightning.callbacks import ModelCheckpoin
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.utilities import rank_zero_info
 from transformers import BertConfig
 from transformers import AdamW, get_linear_schedule_with_warmup
-from torchnlp import get_accuracy
 from model import VIT
 
 class VIT_Model(pl.LightningModule):
@@ -34,12 +35,20 @@ class VIT_Model(pl.LightningModule):
         self.output_dir = Path(self.hparams.output_dir)
         self.current_loss = 0.0
         self.best_loss = sys.maxsize
-        self.transform = transforms.Compose([transforms.CenterCrop(self.confing.image_size),
-                                transforms.ToTensor()])
+    
         self._prepare_dataset()
     
     def _prepare_dataset(self):
-        dataset = torchvision.datasets.ImageFolder(self.hpamras.data_path, transform=self.transforms)
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+        transform = transforms.Compose([
+                                transforms.CenterCrop(self.config.image_size),
+                                transforms.ToTensor(),
+                                normalize,
+                                ])
+        dataset = torchvision.datasets.ImageFolder(self.hparams.data_root, transform=transform)
         train_cnt = int(len(dataset) * self.hparams.train_ratio)
         val_cnt = len(dataset) - train_cnt
         self.train_set, self.val_set = torch.utils.data.random_split(dataset, [train_cnt, val_cnt])
@@ -78,65 +87,72 @@ class VIT_Model(pl.LightningModule):
         return [optimizer], [scheduler]
     
     def train_dataloader(self):
-        train_loader = DataLoader(self.train_set, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=True, drop_last=True)
+        train_loader = DataLoader(self.train_set, batch_size=self.hparams.batch_size, shuffle=True, drop_last=True)
         return train_loader
     
     def val_dataloader(self):
-        val_loader = DataLoader(self.train_set, batch_size=self.hparams.batch_size, num_workers=self.hparams.num_workers, shuffle=True, drop_last=True)
+        val_loader = DataLoader(self.val_set, batch_size=self.hparams.batch_size, shuffle=False, drop_last=True)
         return val_loader
 
     def training_step(self, batch, batch_idx):
-        input_ids, label_cls = batch
+        input_ids, target = batch
 
-        logits = self(input_ids=input_ids)
-        loss_fct = nn.CrossEntropyLoss()
-
-        total_loss = loss_fct(
-            logits.view(-1, self.config.num_classes), logits.view(-1))
+        output = self(input_ids=input_ids)
+        loss_train = F.cross_entropy(output, target)
+        acc1, acc5 = self.__accuracy(output, target, topk=(1, 5))
         
-        accuracy = get_accuracy(label_cls.reshape(-1), logits.argmax(-1).reshape(-1))[0]
-        
-        self.current_loss = total_loss
+        self.current_loss = loss_train
 
-        tensorboard_logs = {'train_loss': total_loss, 
-                            "train_accuracy": accuracy,
+        tensorboard_logs = {'train_loss': loss_train, 
+                            "acc1": acc1,
+                            "acc5": acc5,
                             'learning_rate':  self.lr_scheduler.get_last_lr()[-1]}
 
-        return {'loss': total_loss, 'progress_bar':{'acc': accuracy}, 'log': tensorboard_logs,}
+        return {'loss': loss_train, 'progress_bar':{'acc1': acc1, 'acc5':acc5}, 'log': tensorboard_logs,}
     
     def validation_step(self, batch, batch_idx):
         self.model.eval()
-        input_ids, label_cls = batch
+        input_ids, target = batch
 
-        logits = self(input_ids=input_ids)
-        loss_fct = nn.CrossEntropyLoss()
+        output = self(input_ids=input_ids)
+#         loss_fct = nn.CrossEntropyLoss()
+#         total_loss = loss_fct(
+#             logits.view(-1, self.config.num_classes), label_cls.view(-1))
+        loss_val = F.cross_entropy(output, target)
 
-        total_loss = loss_fct(
-            logits.view(-1, self.config.num_classes), logits.view(-1))
-        
-        accuracy = get_accuracy(label_cls.reshape(-1), logits.argmax(-1).reshape(-1))[0]
-        
-        self.current_loss = total_loss
+        acc1, acc5 = self.__accuracy(output, target, topk=(1, 5))
 
-        return {'val_loss': total_loss, 
-                "val_accuracy": accuracy,
-                }
+        output = OrderedDict({
+            'val_loss': loss_val,
+            'val_acc1': acc1,
+            'val_acc5': acc5,
+        })
+        return output
 
     def validation_epoch_end(self, outputs):
-        avg_loss = torch.stack([x["val_loss"] for x in outputs]).mean()
-        avg_acc = torch.stack([x["val_accuracy"] for x in outputs]).mean()
+        tqdm_dict = {}
+        for metric_name in ["val_loss", "val_acc1", "val_acc5"]:
+            tqdm_dict[metric_name] = torch.stack([output[metric_name] for output in outputs]).mean()
 
-        tensorboard_logs = {
-            "val/loss": avg_loss,
-            "val/accuracy": avg_acc,
-        }
+        result = {'progress_bar': tqdm_dict, 'log': tqdm_dict, 'val_loss': tqdm_dict["val_loss"]}
+        return result
+    
+    @staticmethod
+    def __accuracy(output, target, topk=(1,)):
+        """Computes the accuracy over the k top predictions for the specified values of k"""
+        with torch.no_grad():
+            maxk = max(topk)
+            batch_size = target.size(0)
 
-        return {
-            "val_loss": avg_loss,
-            "log": tensorboard_logs,
-            "progress_bar": tensorboard_logs,
-        }
+            _, pred = output.topk(maxk, 1, True, True)
+            pred = pred.t()
+            correct = pred.eq(target.view(1, -1).expand_as(pred))
 
+            res = []
+            for k in topk:
+                correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+                res.append(correct_k.mul_(100.0 / batch_size))
+            return res
 
     @pl.utilities.rank_zero_only
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
@@ -177,11 +193,12 @@ class VIT_Model(pl.LightningModule):
 
         parser.add_argument("--gradient_clip_val", dest="gradient_clip_val", default=1.0, type=float, help="Max gradient norm")
         parser.add_argument("--learning_rate", default=5e-4, type=float, help="The initial learning rate for Adam.")
+        parser.add_argument("--train_ratio",  default=0.8, type=float, help="train data split ratio")
         parser.add_argument("--weight_decay", default=0.1, type=float, help="Weight decay if we apply some.")
         parser.add_argument("--adam_epsilon", default=1e-8, type=float, help="Epsilon for Adam optimizer.")
         parser.add_argument("--warmup_steps", default=10000, type=int, help="Linear warmup over warmup_steps.")
         parser.add_argument("--total_steps", default=10000000, type=int, help="Linear warmup over total steps.")
-        parser.add_argument("--num_workers", default=4, type=int, help="kwarg passed to DataLoader")
+        parser.add_argument("--num_workers", default=2, type=int, help="kwarg passed to DataLoader")
         parser.add_argument("--num_train_epochs", dest="max_epochs", default=20, type=int)
         parser.add_argument("--batch_size", default=32, type=int)
         return parser
