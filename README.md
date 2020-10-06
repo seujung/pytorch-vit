@@ -1,4 +1,4 @@
-# Visiton Transformer with Pytorch
+# Vision Transformer with Pytorch
 
 Pytorch implementation of [AN IMAGE IS WORTH 16X16 WORDS:
 TRANSFORMERS FOR IMAGE RECOGNITION AT SCALE](https://openreview.net/pdf?id=YicbFdNTTy)
