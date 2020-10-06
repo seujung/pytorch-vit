@@ -1,3 +1,4 @@
+import math
 import torch
 from torch import nn
 from transformers.activations import ACT2FN
@@ -22,8 +23,7 @@ def patch_image(x:torch.Tensor, size:int, ch:int,  N:int):
     for i in range(slice_size):   
         for j in range(slice_size):
             out.append(x[:,:,i*N:(i+1)*N, j*N:(j+1)*N].reshape(batch_size, -1))
-    return torch.stack(out, dim=0)
-
+    return torch.stack(out, dim=1)
 
 class Embedding_Module(nn.Module):
     def __init__(self, config):
@@ -57,7 +57,6 @@ class BertSelfAttention(nn.Module):
                 "The hidden size (%d) is not a multiple of the number of attention "
                 "heads (%d)" % (config.hidden_size, config.num_attention_heads)
             )
-        self.output_attentions = config.output_attentions
 
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
@@ -81,6 +80,7 @@ class BertSelfAttention(nn.Module):
         head_mask=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
+        output_attentions=False,
     ):
         mixed_query_layer = self.query(hidden_states)
 
@@ -123,9 +123,9 @@ class BertSelfAttention(nn.Module):
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
 
-        outputs = (context_layer, attention_probs) if self.output_attentions else (context_layer,)
+        outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
         return outputs
-
+    
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -212,6 +212,7 @@ class BertOutput(nn.Module):
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
+    
 class BertLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -311,6 +312,7 @@ class BertEncoder(nn.Module):
                     encoder_hidden_states,
                     encoder_attention_mask,
                 )
+                
             else:
                 layer_outputs = layer_module(
                     hidden_states,
@@ -332,6 +334,7 @@ class BertEncoder(nn.Module):
         return BaseModelOutput(
             last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions
         )
+    
 class BertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -346,14 +349,50 @@ class BertPooler(nn.Module):
         pooled_output = self.activation(pooled_output)
         return pooled_output
 
+class BertPredictionHeadTransform(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        if isinstance(config.hidden_act, str):
+            self.transform_act_fn = ACT2FN[config.hidden_act]
+        else:
+            self.transform_act_fn = config.hidden_act
+        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, hidden_states):
+        hidden_states = self.dense(hidden_states)
+        hidden_states = self.transform_act_fn(hidden_states)
+        hidden_states = self.LayerNorm(hidden_states)
+        return hidden_states
+
+class PredictionHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.transform = BertPredictionHeadTransform(config)
+
+        # The output weights are the same as the input embeddings, but there is
+        # an output-only bias for each token.
+        self.decoder = nn.Linear(config.hidden_size, config.num_classes, bias=False)
+
+        self.bias = nn.Parameter(torch.zeros(config.num_classes))
+
+        # Need a link between the two variables so that the bias is correctly resized with `resize_token_embeddings`
+        self.decoder.bias = self.bias
+
+    def forward(self, hidden_states):
+        hidden_states = self.transform(hidden_states)
+        hidden_states = self.decoder(hidden_states)
+        return hidden_states
+
 class VIT(BertPreTrainedModel):
     
-    def __init__(self, config, position_emb = True):
-        super().__init__()
+    def __init__(self, config):
+        super().__init__(config)
         self.config = config
         self.embeddings = Embedding_Module(config)
         self.encoder = BertEncoder(config)
         self.pooler = BertPooler(config)
+        self.cls = PredictionHead(config)
         self.cls_token = nn.Parameter(torch.randn(1, 1, self.config.hidden_size))
 
         self.init_weights()
@@ -367,49 +406,56 @@ class VIT(BertPreTrainedModel):
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         output_attentions=None,
-        output_hidden_states=None):
+        output_hidden_states=None,
+        return_dict=None,
+        **kwargs):
 
         if input_ids is not None:
-            input_shape = input_ids.size()
+            input_ids = patch_image(input_ids, size=self.config.image_size, ch=self.config.channel, N=self.config.patch_size)
+            cls_tokens = self.cls_token.expand(input_ids.shape[0], -1, -1)
+            input_ids = torch.cat((cls_tokens, input_ids), dim=1)
+            input_shape = input_ids.size()[0], input_ids.size()[1]
         else:
             raise ValueError("You have to specify input_ids")
         
-        input_ids = patch_image(input_ids, size=self.hparams.image_size, ch=self.hparams.channel, N=self.hparams.patch_size)
-        cls_tokens = self.cls_token.expand(input_ids.shape[0], -1, -1)
-        input_ids = torch.cat((cls_tokens, input_ids), dim=1)
-
+        
         device = input_ids.device 
 
         if attention_mask is None:
             attention_mask = torch.ones(input_shape, device=device)
+            
         
         extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape, device)
+        extended_attention_mask = None
 
         head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
         embedding_output = self.embeddings(
             input_ids=input_ids, position_ids=position_ids)
+        print(embedding_output.shape)
         
         encoder_outputs = self.encoder(
             embedding_output,
             attention_mask=extended_attention_mask,
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_extended_attention_mask,
+            encoder_attention_mask=encoder_attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        
         sequence_output = encoder_outputs[0]
 
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
+        cls_output = self.cls(pooled_output)
 
         if not return_dict:
-            return (sequence_output, pooled_output) + encoder_outputs[1:]
+            return (sequence_output, cls_output) + encoder_outputs[1:]
 
         return BaseModelOutputWithPooling(
             last_hidden_state=sequence_output,
-            pooler_output=pooled_output,
+            pooler_output=cls_output,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
